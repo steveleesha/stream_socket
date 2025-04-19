@@ -11,12 +11,15 @@
 #include <fcntl.h>
 #include <errno.h>
 #include "cJSON.h"
+#include <sys/types.h>
 
 #define PORT 5566
 #define BUFFER_SIZE 1024
 #define MAX_CLIENTS 10
 #define COMMAND_INTERVAL 5  // Send command every 5 seconds
 #define SERVER_STREAM_UPLOAD_URL "rtmp://192.168.1.100/stream"
+#define BROADCAST_PORT 5567
+#define BROADCAST_INTERVAL 5  // 每5秒广播一次
 
 typedef struct {
     int socket;
@@ -214,6 +217,7 @@ void handle_client_message_by_index(int client_index, char *buffer) {
     cJSON *root = cJSON_Parse(buffer);
     if (root) {
         char *json_str = cJSON_Print(root);
+        printf("\n%s\n", json_str);
         free(json_str);
 
         cJSON *reason = cJSON_GetObjectItem(root, "reason");
@@ -233,6 +237,92 @@ void handle_client_message_by_index(int client_index, char *buffer) {
         }
         cJSON_Delete(root);
     }
+}
+
+// 广播线程函数
+void *broadcast_thread(void *arg) {
+    int broadcast_sock;
+    struct sockaddr_in broadcast_addr;
+    int broadcast_enable = 1;
+    char broadcast_message[256];
+    
+    // 创建UDP套接字
+    if ((broadcast_sock = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+        perror("broadcast socket create failed");
+        return NULL;
+    }
+    
+    // 设置广播选项
+    if (setsockopt(broadcast_sock, SOL_SOCKET, SO_BROADCAST, &broadcast_enable, sizeof(broadcast_enable)) < 0) {
+        perror("set broadcast option failed");
+        close(broadcast_sock);
+        return NULL;
+    }
+    
+    // 设置广播地址
+    memset(&broadcast_addr, 0, sizeof(broadcast_addr));
+    broadcast_addr.sin_family = AF_INET;
+    broadcast_addr.sin_port = htons(BROADCAST_PORT);
+    broadcast_addr.sin_addr.s_addr = inet_addr("255.255.255.255");  // 广播地址
+    
+    // 获取本机IP地址
+    char host_ip[INET_ADDRSTRLEN];
+    struct sockaddr_in host_addr;
+    socklen_t host_len = sizeof(host_addr);
+    
+    // 创建一个临时套接字来获取本机IP
+    int temp_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (temp_sock < 0) {
+        perror("temp socket create failed");
+        close(broadcast_sock);
+        return NULL;
+    }
+    
+    // 连接到一个外部地址（不会真正发送数据）
+    memset(&host_addr, 0, sizeof(host_addr));
+    host_addr.sin_family = AF_INET;
+    host_addr.sin_port = htons(80);
+    host_addr.sin_addr.s_addr = inet_addr("8.8.8.8");  // 谷歌DNS服务器
+    
+    if (connect(temp_sock, (struct sockaddr*)&host_addr, sizeof(host_addr)) < 0) {
+        perror("temp connect failed");
+        close(temp_sock);
+        close(broadcast_sock);
+        return NULL;
+    }
+    
+    // 获取本机地址
+    if (getsockname(temp_sock, (struct sockaddr*)&host_addr, &host_len) < 0) {
+        perror("get local ip failed");
+        close(temp_sock);
+        close(broadcast_sock);
+        return NULL;
+    }
+    
+    inet_ntop(AF_INET, &host_addr.sin_addr, host_ip, INET_ADDRSTRLEN);
+    close(temp_sock);
+    
+    printf("server ip: %s\n", host_ip);
+    
+    // 准备广播消息
+    snprintf(broadcast_message, sizeof(broadcast_message), 
+             "{\"server_ip\":\"%s\",\"server_port\":%d}", 
+             host_ip, PORT);
+    
+    // 广播循环
+    while (1) {
+        if (sendto(broadcast_sock, broadcast_message, strlen(broadcast_message), 0,
+                  (struct sockaddr*)&broadcast_addr, sizeof(broadcast_addr)) < 0) {
+            perror("broadcast send failed");
+        } else {
+            printf("Broadcast message: %s\n", broadcast_message);
+        }
+        
+        sleep(BROADCAST_INTERVAL);
+    }
+    
+    close(broadcast_sock);
+    return NULL;
 }
 
 int main() {
@@ -276,6 +366,13 @@ int main() {
     if (pthread_create(&kb_thread, NULL, keyboard_thread, NULL) != 0) {
         perror("create keyboard thread failed");
         exit(EXIT_FAILURE);
+    }
+    
+    // 在main函数中创建广播线程
+    pthread_t bc_thread;
+    if (pthread_create(&bc_thread, NULL, broadcast_thread, NULL) != 0) {
+        perror("create broadcast thread failed");
+        // 继续运行，不退出
     }
     
     // 主循环接受客户端连接

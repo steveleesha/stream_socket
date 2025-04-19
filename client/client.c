@@ -16,9 +16,12 @@
 #define RTSP_URL "rtsp://admin:admin123456@127.0.0.1:8554/profile1"
 #endif
 
+#define BROADCAST_PORT 5567
+#define DISCOVERY_TIMEOUT 30  // 30秒超时
+
 void send_initial_message(int sock) {
     cJSON *root = cJSON_CreateObject();
-    cJSON_AddStringToObject(root, "reason", "stream_monitoring");
+    cJSON_AddStringToObject(root, "reason", "init_slam");
     
     // 如果有预设的RTSP URL，则添加到初始消息中
     // 如果没有，服务器可能会在后续命令中提供URL
@@ -52,33 +55,134 @@ int robot_move(const char *direction, int duration) {
     return 0;
 }
 
+// 接收广播发现服务器
+int discover_server(char *server_ip, int *server_port) {
+    int broadcast_sock;
+    struct sockaddr_in broadcast_addr, server_addr;
+    socklen_t addr_len = sizeof(server_addr);
+    char buffer[BUFFER_SIZE];
+    fd_set readfds;
+    struct timeval timeout;
+    
+    // 创建UDP套接字
+    if ((broadcast_sock = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+        perror("广播接收套接字创建失败");
+        return -1;
+    }
+    
+    // 设置套接字选项，允许重用地址
+    int opt = 1;
+    if (setsockopt(broadcast_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        perror("设置套接字选项失败");
+        close(broadcast_sock);
+        return -1;
+    }
+    
+    // 绑定到广播端口
+    memset(&broadcast_addr, 0, sizeof(broadcast_addr));
+    broadcast_addr.sin_family = AF_INET;
+    broadcast_addr.sin_port = htons(BROADCAST_PORT);
+    broadcast_addr.sin_addr.s_addr = INADDR_ANY;
+    
+    if (bind(broadcast_sock, (struct sockaddr*)&broadcast_addr, sizeof(broadcast_addr)) < 0) {
+        perror("绑定广播端口失败");
+        close(broadcast_sock);
+        return -1;
+    }
+    
+    printf("等待发现服务器...\n");
+    
+    // 设置超时
+    FD_ZERO(&readfds);
+    FD_SET(broadcast_sock, &readfds);
+    timeout.tv_sec = DISCOVERY_TIMEOUT;
+    timeout.tv_usec = 0;
+    
+    // 等待广播消息
+    if (select(broadcast_sock + 1, &readfds, NULL, NULL, &timeout) <= 0) {
+        printf("发现服务器超时\n");
+        close(broadcast_sock);
+        return -1;
+    }
+    
+    // 接收广播消息
+    int bytes_received = recvfrom(broadcast_sock, buffer, BUFFER_SIZE - 1, 0,
+                                 (struct sockaddr*)&server_addr, &addr_len);
+    
+    if (bytes_received <= 0) {
+        perror("接收广播消息失败");
+        close(broadcast_sock);
+        return -1;
+    }
+    
+    buffer[bytes_received] = '\0';
+    printf("收到服务器广播: %s\n", buffer);
+    
+    // 解析JSON消息
+    cJSON *root = cJSON_Parse(buffer);
+    if (!root) {
+        printf("解析广播消息失败\n");
+        close(broadcast_sock);
+        return -1;
+    }
+    
+    cJSON *ip = cJSON_GetObjectItem(root, "server_ip");
+    cJSON *port = cJSON_GetObjectItem(root, "server_port");
+    
+    if (!ip || !port) {
+        printf("广播消息格式错误\n");
+        cJSON_Delete(root);
+        close(broadcast_sock);
+        return -1;
+    }
+    
+    strcpy(server_ip, ip->valuestring);
+    *server_port = port->valueint;
+    
+    cJSON_Delete(root);
+    close(broadcast_sock);
+    
+    printf("发现服务器: IP=%s, 端口=%d\n", server_ip, *server_port);
+    return 0;
+}
+
 int main() {
     int sock = 0;
     struct sockaddr_in serv_addr;
     char buffer[BUFFER_SIZE] = {0};
+    char server_ip[INET_ADDRSTRLEN];
+    int server_port = PORT;
     
-    // Create socket
+    // 尝试通过广播发现服务器
+    if (discover_server(server_ip, &server_port) < 0) {
+        // 如果发现失败，使用默认设置
+        strcpy(server_ip, SERVER_IP);
+        server_port = PORT;
+        printf("使用默认服务器设置: IP=%s, 端口=%d\n", server_ip, server_port);
+    }
+    
+    // 创建套接字
     if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-        perror("Socket creation error");
+        perror("套接字创建失败");
         return 1;
     }
     
     serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(PORT);
+    serv_addr.sin_port = htons(server_port);
     
-    // Convert IP address to binary form
-    if (inet_pton(AF_INET, SERVER_IP, &serv_addr.sin_addr) <= 0) {
-        perror("Invalid address/ Address not supported");
+    // 转换IP地址
+    if (inet_pton(AF_INET, server_ip, &serv_addr.sin_addr) <= 0) {
+        perror("无效的地址/不支持的地址");
         return 1;
     }
     
-    // Connect to server
+    // 连接到服务器
     if (connect(sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
-        perror("Connection Failed");
+        perror("连接失败");
         return 1;
     }
     
-    printf("Connected to server\n");
+    printf("已连接到服务器 %s:%d\n", server_ip, server_port);
     
     // Send initial message
     send_initial_message(sock);
