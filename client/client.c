@@ -5,6 +5,9 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <pthread.h>
+#include <signal.h>
+#include <errno.h>
 #include "cJSON.h"
 
 #define SERVER_IP "127.0.0.1"
@@ -19,6 +22,20 @@
 #define BROADCAST_PORT 5567
 #define DISCOVERY_TIMEOUT 30  // 30秒超时
 
+// 全局变量，用于控制连接状态
+volatile int connected = 0;
+int server_sock = -1;
+
+// 信号处理函数，用于优雅地关闭连接
+void signal_handler(int sig) {
+    if (server_sock >= 0) {
+        printf("关闭连接并退出...\n");
+        close(server_sock);
+    }
+    exit(0);
+}
+
+// 发送初始消息
 void send_initial_message(int sock) {
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "reason", "init_slam");
@@ -146,25 +163,15 @@ int discover_server(char *server_ip, int *server_port) {
     return 0;
 }
 
-int main() {
+// 连接到服务器的函数
+int connect_to_server(const char *server_ip, int server_port) {
     int sock = 0;
     struct sockaddr_in serv_addr;
-    char buffer[BUFFER_SIZE] = {0};
-    char server_ip[INET_ADDRSTRLEN];
-    int server_port = PORT;
-    
-    // 尝试通过广播发现服务器
-    if (discover_server(server_ip, &server_port) < 0) {
-        // 如果发现失败，使用默认设置
-        strcpy(server_ip, SERVER_IP);
-        server_port = PORT;
-        printf("使用默认服务器设置: IP=%s, 端口=%d\n", server_ip, server_port);
-    }
     
     // 创建套接字
     if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
         perror("套接字创建失败");
-        return 1;
+        return -1;
     }
     
     serv_addr.sin_family = AF_INET;
@@ -173,25 +180,34 @@ int main() {
     // 转换IP地址
     if (inet_pton(AF_INET, server_ip, &serv_addr.sin_addr) <= 0) {
         perror("无效的地址/不支持的地址");
-        return 1;
+        close(sock);
+        return -1;
     }
     
     // 连接到服务器
     if (connect(sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
         perror("连接失败");
-        return 1;
+        close(sock);
+        return -1;
     }
     
     printf("已连接到服务器 %s:%d\n", server_ip, server_port);
     
-    // Send initial message
+    // 发送初始消息
     send_initial_message(sock);
     
-    // Main loop to receive commands
-    while (1) {
-        int bytes_read = recv(sock, buffer, BUFFER_SIZE, 0);
+    return sock;
+}
+
+// 处理服务器消息的线程函数
+void *server_handler(void *arg) {
+    int sock = *((int *)arg);
+    char buffer[BUFFER_SIZE];
+    
+    while (connected) {
+        int bytes_read = recv(sock, buffer, BUFFER_SIZE - 1, 0);
         if (bytes_read > 0) {
-            buffer[bytes_read] = '\0'; // 确保字符串正确终止
+            buffer[bytes_read] = '\0';
             cJSON *root = cJSON_Parse(buffer);
             if (root) {
                 cJSON *command = cJSON_GetObjectItem(root, "command");
@@ -225,7 +241,7 @@ int main() {
                             printf("移动方向: 停止\n");
                         }
                     } else {
-                        printf("unknown command: %s\n", command->valuestring);
+                        printf("未知命令: %s\n", command->valuestring);
                     }
                 }
                 
@@ -233,13 +249,217 @@ int main() {
             }
         } else if (bytes_read == 0) {
             printf("服务器断开连接\n");
+            connected = 0;
             break;
-        } else {
+        } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
             perror("接收失败");
+            connected = 0;
             break;
         }
     }
     
-    close(sock);
+    return NULL;
+}
+
+// 显示帮助信息
+void show_help() {
+    printf("\n可用命令:\n");
+    printf("  connect - 自动发现并连接到服务器\n");
+    printf("  connect IP [PORT] - 连接到指定IP和端口的服务器\n");
+    printf("  disconnect - 断开与服务器的连接\n");
+    printf("  status - 显示当前连接状态\n");
+    printf("  help - 显示此帮助信息\n");
+    printf("  exit - 退出程序\n");
+}
+
+// 添加线程参数结构体
+typedef struct {
+    char server_ip[INET_ADDRSTRLEN];
+    int server_port;
+} ConnectionParams;
+
+// 连接线程函数
+void *connection_thread(void *arg) {
+    ConnectionParams *params = (ConnectionParams *)arg;
+    char server_ip[INET_ADDRSTRLEN];
+    int server_port = PORT;
+    
+    // 复制参数，因为我们会释放传入的结构体
+    strcpy(server_ip, params->server_ip);
+    server_port = params->server_port;
+    free(params);
+    
+    printf("开始连接过程...\n");
+    
+    // 尝试通过广播发现服务器
+    if (strlen(server_ip) == 0) {
+        printf("尝试自动发现服务器...\n");
+        if (discover_server(server_ip, &server_port) < 0) {
+            // 如果发现失败，使用默认设置
+            strcpy(server_ip, SERVER_IP);
+            server_port = PORT;
+            printf("自动发现失败，使用默认服务器设置: IP=%s, 端口=%d\n", server_ip, server_port);
+        }
+    }
+    
+    // 连接到服务器
+    int sock = connect_to_server(server_ip, server_port);
+    if (sock < 0) {
+        printf("连接服务器失败\n");
+        return NULL;
+    }
+    
+    // 保存连接套接字
+    server_sock = sock;
+    connected = 1;
+    
+    // 创建处理服务器消息的线程
+    pthread_t server_thread;
+    if (pthread_create(&server_thread, NULL, server_handler, &server_sock) != 0) {
+        perror("创建服务器处理线程失败");
+        close(server_sock);
+        server_sock = -1;
+        connected = 0;
+        return NULL;
+    }
+    
+    pthread_detach(server_thread);
+    return NULL;
+}
+
+// 主函数
+int main() {
+    char server_ip[INET_ADDRSTRLEN];
+    int server_port = PORT;
+    char cmd_buffer[256];
+    pthread_t server_thread;
+    
+    // 设置信号处理
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+    
+    printf("客户端启动，等待命令...\n");
+    show_help();
+    
+    while (1) {
+        printf("> ");
+        fflush(stdout);
+        
+        // 读取命令
+        if (fgets(cmd_buffer, sizeof(cmd_buffer), stdin) == NULL) {
+            continue;
+        }
+        
+        // 移除换行符
+        cmd_buffer[strcspn(cmd_buffer, "\n")] = 0;
+        
+        // 处理命令
+        if (strcmp(cmd_buffer, "connect") == 0) {
+            if (connected) {
+                printf("已经连接到服务器\n");
+                continue;
+            }
+            
+            // 创建连接参数
+            ConnectionParams *params = malloc(sizeof(ConnectionParams));
+            if (!params) {
+                perror("内存分配失败");
+                continue;
+            }
+            
+            // 默认使用空IP，表示自动发现
+            params->server_ip[0] = '\0';
+            params->server_port = PORT;
+            
+            // 创建连接线程
+            pthread_t conn_thread;
+            if (pthread_create(&conn_thread, NULL, connection_thread, params) != 0) {
+                perror("创建连接线程失败");
+                free(params);
+                continue;
+            }
+            
+            pthread_detach(conn_thread);
+            printf("正在后台连接服务器...\n");
+            
+        } else if (strcmp(cmd_buffer, "connect") > 0 && strncmp(cmd_buffer, "connect ", 8) == 0) {
+            // 支持手动指定服务器地址，格式: connect IP [PORT]
+            if (connected) {
+                printf("已经连接到服务器，请先断开连接\n");
+                continue;
+            }
+            
+            char ip_str[INET_ADDRSTRLEN] = {0};
+            int port = PORT;
+            
+            // 解析命令行参数
+            char *token = strtok(cmd_buffer + 8, " ");
+            if (token) {
+                strncpy(ip_str, token, INET_ADDRSTRLEN - 1);
+                token = strtok(NULL, " ");
+                if (token) {
+                    port = atoi(token);
+                    if (port <= 0 || port > 65535) {
+                        printf("无效的端口号，使用默认端口 %d\n", PORT);
+                        port = PORT;
+                    }
+                }
+            }
+            
+            // 创建连接参数
+            ConnectionParams *params = malloc(sizeof(ConnectionParams));
+            if (!params) {
+                perror("内存分配失败");
+                continue;
+            }
+            
+            strcpy(params->server_ip, ip_str);
+            params->server_port = port;
+            
+            // 创建连接线程
+            pthread_t conn_thread;
+            if (pthread_create(&conn_thread, NULL, connection_thread, params) != 0) {
+                perror("创建连接线程失败");
+                free(params);
+                continue;
+            }
+            
+            pthread_detach(conn_thread);
+            printf("正在后台连接到 %s:%d...\n", ip_str, port);
+            
+        } else if (strcmp(cmd_buffer, "disconnect") == 0) {
+            if (!connected) {
+                printf("未连接到服务器\n");
+                continue;
+            }
+            
+            printf("断开与服务器的连接\n");
+            connected = 0;
+            close(server_sock);
+            server_sock = -1;
+            
+        } else if (strcmp(cmd_buffer, "status") == 0) {
+            if (connected) {
+                printf("当前已连接到服务器\n");
+            } else {
+                printf("当前未连接到服务器\n");
+            }
+        } else if (strcmp(cmd_buffer, "help") == 0) {
+            show_help();
+            
+        } else if (strcmp(cmd_buffer, "exit") == 0) {
+            printf("退出程序\n");
+            if (connected) {
+                connected = 0;
+                close(server_sock);
+            }
+            break;
+            
+        } else if (strlen(cmd_buffer) > 0) {
+            printf("未知命令: %s\n", cmd_buffer);
+            show_help();
+        }
+    }
+    
     return 0;
 } 
