@@ -8,6 +8,9 @@
 #include <pthread.h>
 #include <signal.h>
 #include <errno.h>
+#include <time.h>   // 添加时间头文件
+#include <sys/stat.h>  // 添加文件状态头文件
+#include <fcntl.h>  // 添加文件控制头文件
 #include "cJSON.h"
 
 #define SERVER_IP "127.0.0.1"
@@ -199,6 +202,89 @@ int connect_to_server(const char *server_ip, int server_port) {
     return sock;
 }
 
+// 模拟拍摄照片，实际应用中可能调用摄像头API
+int capture_jpeg(const char *filename) {
+    // 模拟拍照，仅用于演示
+    // 实际应用中，这里应该调用相机API拍照
+    printf("模拟拍摄照片: %s\n", filename);
+    
+    // 创建一个简单的测试图像文件（如果实际系统中没有摄像头）
+    FILE *fp = fopen(filename, "w");
+    if (!fp) {
+        perror("无法创建图像文件");
+        return -1;
+    }
+    
+    // 写入一些假数据，表示JPEG文件内容
+    const char *test_data = "JPEG TEST IMAGE DATA";
+    fwrite(test_data, strlen(test_data), 1, fp);
+    fclose(fp);
+    
+    return 0;
+}
+
+// 发送JPEG图像给服务器
+int send_jpeg_image(int sock, const char *filename) {
+    // 打开文件
+    FILE *fp = fopen(filename, "rb");
+    if (!fp) {
+        perror("无法打开图像文件");
+        return -1;
+    }
+    
+    // 获取文件大小
+    struct stat file_stat;
+    if (stat(filename, &file_stat) < 0) {
+        perror("无法获取文件状态");
+        fclose(fp);
+        return -1;
+    }
+    
+    // 准备要发送的JSON头信息
+    cJSON *header = cJSON_CreateObject();
+    cJSON_AddStringToObject(header, "response", "jpeg_image");
+    cJSON_AddNumberToObject(header, "timestamp", (double)time(NULL));
+    cJSON_AddNumberToObject(header, "size", (double)file_stat.st_size);
+    
+    char *header_str = cJSON_PrintUnformatted(header);
+    
+    // 发送头信息
+    if (send(sock, header_str, strlen(header_str), 0) < 0) {
+        perror("发送图像头信息失败");
+        free(header_str);
+        cJSON_Delete(header);
+        fclose(fp);
+        return -1;
+    }
+    
+    // 给服务器一点时间处理头信息
+    usleep(100000);  // 100ms
+    
+    // 读取并发送文件内容
+    char buffer[4096];
+    size_t bytes_read;
+    size_t total_sent = 0;
+    
+    while ((bytes_read = fread(buffer, 1, sizeof(buffer), fp)) > 0) {
+        if (send(sock, buffer, bytes_read, 0) < 0) {
+            perror("发送图像数据失败");
+            free(header_str);
+            cJSON_Delete(header);
+            fclose(fp);
+            return -1;
+        }
+        total_sent += bytes_read;
+    }
+    
+    printf("已发送图像 %s (%zu 字节)\n", filename, total_sent);
+    
+    free(header_str);
+    cJSON_Delete(header);
+    fclose(fp);
+    
+    return 0;
+}
+
 // 处理服务器消息的线程函数
 void *server_handler(void *arg) {
     int sock = *((int *)arg);
@@ -239,6 +325,22 @@ void *server_handler(void *arg) {
                             robot_move(direction->valuestring, 0);
                         } else if (!direction) {
                             printf("移动方向: 停止\n");
+                        }
+                    } else if (strcmp(command->valuestring, "get_jpeg") == 0) {
+                        // 处理获取JPEG图像命令
+                        printf("收到获取JPEG图像命令\n");
+                        
+                        // 生成临时文件名
+                        char filename[64];
+                        sprintf(filename, "capture_%ld.jpg", (long)time(NULL));
+                        
+                        // 拍照
+                        if (capture_jpeg(filename) == 0) {
+                            // 发送图像
+                            send_jpeg_image(sock, filename);
+                            
+                            // 删除临时文件
+                            remove(filename);
                         }
                     } else {
                         printf("未知命令: %s\n", command->valuestring);

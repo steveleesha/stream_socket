@@ -77,6 +77,19 @@ void send_move_command(int client_socket, const char *direction, int duration) {
     cJSON_Delete(root);
 }
 
+// 发送获取JPEG图像命令
+void send_get_jpeg_command(int client_socket) {
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "command", "get_jpeg");
+    cJSON_AddNumberToObject(root, "timestamp", (double)time(NULL));
+    
+    char *json_str = cJSON_PrintUnformatted(root);
+    send(client_socket, json_str, strlen(json_str), 0);
+    printf("send get_jpeg command\n");
+    free(json_str);
+    cJSON_Delete(root);
+}
+
 // 设置终端为非阻塞模式
 void set_nonblocking_input() {
     struct termios ttystate;
@@ -105,6 +118,7 @@ void show_help() {
     printf("\n可用命令:\n");
     printf("  c - 向所有客户端发送状态检查命令\n");
     printf("  m - 发送移动命令 (会提示输入方向和时间)\n");
+    printf("  j - 请求所有客户端发送一张JPEG图像\n");
     printf("  h - 显示此帮助信息\n");
     printf("  q - 退出服务器\n");
 }
@@ -152,6 +166,14 @@ void *keyboard_thread(void *arg) {
                     break;
                 }
                 
+                case 'j':
+                    pthread_mutex_lock(&clients_mutex);
+                    for (int i = 0; i < client_count; i++) {
+                        send_get_jpeg_command(clients[i].socket);
+                    }
+                    pthread_mutex_unlock(&clients_mutex);
+                    break;
+                    
                 case 'h':
                     show_help();
                     break;
@@ -210,6 +232,60 @@ void *client_handler(void *arg) {
     return NULL;
 }
 
+// 接收客户端发送的JPEG图像
+int receive_jpeg_image(int client_socket, const char *client_ip, long long size) {
+    char image_path[256];
+    time_t current_time = time(NULL);
+    struct tm *time_info = localtime(&current_time);
+    
+    // 创建保存图像的目录
+    mkdir("images", 0755);
+    
+    // 生成唯一文件名，包含客户端IP和时间
+    sprintf(image_path, "images/%s_%04d%02d%02d_%02d%02d%02d.jpg",
+            client_ip,
+            time_info->tm_year + 1900, time_info->tm_mon + 1, time_info->tm_mday,
+            time_info->tm_hour, time_info->tm_min, time_info->tm_sec);
+    
+    // 打开文件进行写入
+    FILE *fp = fopen(image_path, "wb");
+    if (!fp) {
+        perror("无法创建图像文件");
+        return -1;
+    }
+    
+    printf("正在接收图像数据，大小: %lld 字节\n", size);
+    
+    // 读取并保存图像数据
+    char buffer[4096];
+    size_t bytes_read;
+    size_t total_received = 0;
+    
+    while (total_received < size) {
+        bytes_read = recv(client_socket, buffer, 
+                         sizeof(buffer) < (size - total_received) ? sizeof(buffer) : (size - total_received), 
+                         0);
+        
+        if (bytes_read <= 0) {
+            perror("接收图像数据失败");
+            fclose(fp);
+            return -1;
+        }
+        
+        fwrite(buffer, 1, bytes_read, fp);
+        total_received += bytes_read;
+        
+        // 显示进度
+        printf("\r接收进度: %.1f%%", (total_received * 100.0) / size);
+        fflush(stdout);
+    }
+    
+    printf("\n图像接收完成，已保存至 %s\n", image_path);
+    fclose(fp);
+    
+    return 0;
+}
+
 // 添加一个新函数，通过索引处理客户端消息
 void handle_client_message_by_index(int client_index, char *buffer) {
     ClientInfo *client = &clients[client_index];
@@ -220,11 +296,16 @@ void handle_client_message_by_index(int client_index, char *buffer) {
         printf("\n%s\n", json_str);
         free(json_str);
 
+        // 处理初始化消息
         cJSON *reason = cJSON_GetObjectItem(root, "reason");
         cJSON *rtsp_url = cJSON_GetObjectItem(root, "rtsp_url");
         
+        // 处理图像响应
+        cJSON *response = cJSON_GetObjectItem(root, "response");
+        cJSON *size = cJSON_GetObjectItem(root, "size");
+        
         if (reason) {
-            // 更新客户端信息
+            // 初始化消息处理
             strcpy(client->reason, reason->valuestring);
             printf("Client %s (ID: %d):\n", client->ip_addr, client_index);
             printf("reason: %s\n", client->reason);
@@ -234,6 +315,12 @@ void handle_client_message_by_index(int client_index, char *buffer) {
             }
 
             send_upload_url(client->socket, SERVER_STREAM_UPLOAD_URL);
+        } else if (response && strcmp(response->valuestring, "jpeg_image") == 0 && size) {
+            // JPEG图像响应处理
+            printf("接收到图像响应，客户端: %s\n", client->ip_addr);
+            
+            // 接收图像数据
+            receive_jpeg_image(client->socket, client->ip_addr, (long long)size->valuedouble);
         }
         cJSON_Delete(root);
     }
